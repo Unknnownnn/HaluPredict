@@ -1,225 +1,145 @@
 # HaluPredict — LLM Hallucination Guardrail
 
-A real-time groundedness guardrail for LLM output. Given `(context, prompt, response)`, it
-scores whether the response is supported by the supplied context and flags hallucination
-before the user sees it.
+A machine-learning guardrail that checks whether an AI's answer is actually supported by the
+source text it was given, and flags it when it is not.
 
-Built as a predictive-analytics project on 64,507 labelled examples from
-[HaluEval](https://github.com/RUCAIBox/HaluEval).
-
----
-
-## Architecture
-
-```mermaid
-flowchart TD
-    classDef data  fill:#eef2ff,stroke:#4f46e5,stroke-width:1.5px,color:#1e1b4b
-    classDef feat  fill:#ecfeff,stroke:#0891b2,stroke-width:1.5px,color:#083344
-    classDef train fill:#f0fdf4,stroke:#16a34a,stroke-width:1.5px,color:#052e16
-    classDef nli   fill:#fef3c7,stroke:#d97706,stroke-width:1.5px,color:#451a03
-    classDef serve fill:#fdf2f8,stroke:#db2777,stroke-width:1.5px,color:#500724
-    classDef store fill:#f8fafc,stroke:#64748b,stroke-width:1.5px,color:#0f172a
-    classDef eval  fill:#f5f3ff,stroke:#7c3aed,stroke-width:1.5px,color:#2e1065
-
-    subgraph DATA["1 - Data layer"]
-        direction TB
-        D1["HaluEval corpus<br/>dialogue 10k - QA 10k - summarization 10k - general 4.5k"]
-        D2["JSONL loader<br/>per-line JSONDecodeError recovery"]
-        D3["Pair expansion<br/>correct response + hallucinated twin"]
-        D4["Unified schema<br/>context - prompt - response<br/>is_hallucination - task_type - group_id"]
-        D5["64,507 labelled rows<br/>approx 52 / 48 class balance"]
-        D1 --> D2
-        D2 --> D3
-        D3 --> D4
-        D4 --> D5
-    end
-
-    subgraph FEAT["2 - Feature engineering - 8 scalars"]
-        direction TB
-        F1["Text normalisation<br/>lowercase - strip punctuation - collapse whitespace"]
-        F2["all-MiniLM-L6-v2<br/>384-d sentence embeddings - GPU"]
-        F3["Semantic<br/>cosine_similarity - prompt_response_cosine"]
-        F4["Structural<br/>reference_length - response_length - length_ratio"]
-        F5["Lexical / numeric<br/>lexical_overlap - unsupported_number_ratio"]
-        F6["Flag<br/>context_missing"]
-        F7["Feature matrix X - N x 8"]
-        F1 --> F2
-        F2 --> F3
-        F3 --> F7
-        F1 --> F4
-        F4 --> F7
-        F1 --> F5
-        F5 --> F7
-        F1 --> F6
-        F6 --> F7
-    end
-
-    subgraph SPLIT["3 - Validation protocol"]
-        direction TB
-        S1["StratifiedGroupKFold<br/>group_id keeps paired twins together"]
-        S2["Group-disjoint 80 / 20 hold-out"]
-        S3["5-fold OOF scores<br/>scaler fitted inside each fold"]
-        S1 --> S2
-        S1 --> S3
-    end
-
-    subgraph TRAIN["4 - Tier-1 - soft-voting ensemble"]
-        direction TB
-        T0["StandardScaler"]
-        T1["Logistic Regression"]
-        T2["Random Forest - 100 trees"]
-        T3["Decision Tree"]
-        T4["SVM - RBF kernel"]
-        T5["ANN - TorchMLPClassifier<br/>8 -> 128 -> 64 -> 1<br/>LayerNorm - ReLU - Dropout 0.2<br/>BCEWithLogits + pos_weight<br/>AdamW - early stop on val AP"]
-        T6["Soft voting<br/>mean of predicted probabilities"]
-        T7["Threshold tuning on OOF only<br/>max recall s.t. precision >= 0.75<br/>gate band 0.35 - 0.65"]
-        T0 --> T1
-        T0 --> T2
-        T0 --> T3
-        T0 --> T4
-        T0 --> T5
-        T1 --> T6
-        T2 --> T6
-        T3 --> T6
-        T4 --> T6
-        T5 --> T6
-        T6 --> T7
-    end
-
-    subgraph SERVE["5 - Cascaded inference"]
-        direction TB
-        I0["Request<br/>context - prompt - response"]
-        I1["normalise -> embed -> build_features<br/>8 scalars -> scaler.transform"]
-        I2["Tier-1 ensemble<br/>risk score - ~35 ms GPU"]
-        I3{"gate_low <= score <= gate_high ?"}
-        I4["Tier-2 NLI cross-encoder<br/>nli-deberta-v3-small - 568 MB<br/>premise = context, hypothesis = response<br/>score = 1 - P(entailment) - ~26 ms GPU"]
-        I5["final = 0.4 * tier1 + 0.6 * tier2"]
-        I6{"final >= cascade threshold ?"}
-        I7{"tier1 >= tier1 threshold ?"}
-        I8["SAFE - grounded"]
-        I9["FLAG - hallucination"]
-        I0 --> I1
-        I1 --> I2
-        I2 --> I3
-        I3 -->|"no - confident"| I7
-        I3 -->|"yes - uncertain"| I4
-        I4 --> I5
-        I5 --> I6
-        I7 -->|"yes"| I9
-        I7 -->|"no"| I8
-        I6 -->|"yes"| I9
-        I6 -->|"no"| I8
-    end
-
-    subgraph STORE["6 - Artifact contract - schema 1.1"]
-        direction TB
-        A1["guardrail_scaler.joblib"]
-        A2["tier1_voting_ensemble.joblib<br/>pickles TorchMLPClassifier by reference"]
-        A3["guardrail_metadata.json<br/>feature order - thresholds - gate bounds<br/>weights - model list - library versions"]
-        A4["load_guardrail()<br/>refuses unknown schema"]
-        A1 --> A4
-        A2 --> A4
-        A3 --> A4
-    end
-
-    subgraph SURF["7 - Serving surfaces"]
-        direction TB
-        P1["CascadedGuardrailPipeline.predict()"]
-        P2["predict_streaming()<br/>sentence-prefix scan"]
-        P3["ipywidgets form"]
-        P4["Gradio app<br/>single check - sentence scan - live typing"]
-        P5["MCP tool - planned<br/>score_grounding - scan_draft"]
-        P1 --> P3
-        P1 --> P4
-        P1 --> P5
-        P2 --> P4
-    end
-
-    subgraph EVAL["8 - Evaluation"]
-        direction TB
-        E1["Held-out test - 12,902 rows"]
-        E2["Average Precision - per-model AP<br/>precision / recall / F1 - confusion"]
-        E3["Latency P50 / P95 / P99<br/>GPU vs CPU - escalation rate"]
-        E1 --> E2
-        E1 --> E3
-    end
-
-    D5 ==> F1
-    F7 ==> S1
-    S2 ==> T0
-    S3 ==> T7
-    T0 ==> A1
-    T6 ==> A2
-    T7 ==> A3
-    A4 ==> P1
-    P2 ==> E1
-    P1 ==> E1
-
-    class D1,D2,D3,D4,D5 data
-    class F1,F2,F3,F4,F5,F6,F7 feat
-    class S1,S2,S3 train
-    class T0,T1,T2,T3,T4,T5,T6,T7 train
-    class I0,I1,I2,I3,I5,I6,I7,I8,I9 serve
-    class I4 nli
-    class A1,A2,A3,A4 store
-    class P1,P2,P3,P4,P5 serve
-    class E1,E2,E3 eval
-```
-
-### Cascade inference path
-
-```mermaid
-flowchart LR
-    classDef fast fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#052e16
-    classDef slow fill:#fef3c7,stroke:#d97706,stroke-width:1.5px,color:#451a03
-    classDef out  fill:#111827,stroke:#111827,color:#ffffff
-
-    IN["context - prompt - response"] --> FE["8 features<br/>~1 ms"]
-    FE --> T1["Tier-1 ensemble<br/>LR - RF - DT - SVM - ANN<br/>~35 ms"]
-    T1 --> G{"0.35 - 0.65 ?"}
-    G -->|"~75% confident"| F["Tier-1 fast path<br/>flag if score >= t1"]
-    G -->|"~25% uncertain"| T2["Tier-2 NLI<br/>deberta-v3-small<br/>~26 ms GPU / 527 ms CPU"]
-    T2 --> BL["0.4 * t1 + 0.6 * t2"]
-    BL --> S["flag if score >= cascade threshold"]
-    F --> O["verdict + risk + path"]
-    S --> O
-
-    class F fast
-    class T2,BL slow
-    class O out
-```
-
-Source files: [`docs/architecture.mmd`](docs/architecture.mmd), [`docs/cascade-flow.mmd`](docs/cascade-flow.mmd).
+Built on 64,507 labelled examples from [HaluEval](https://github.com/RUCAIBox/HaluEval) as a
+predictive-analytics project.
 
 ---
 
-## The idea in one paragraph
+## The problem, in plain terms
 
-LLMs produce fluent text that is sometimes unfaithful to the source it was given. HaluPredict
-scores **groundedness**: is this response consistent with this context? It is deliberately not a
-world-knowledge fact-checker — if the context is wrong, a faithful answer is still "correct" under
-this definition. Detection runs as a **two-tier cascade**: a five-model soft-voting ensemble
-resolves the ~75% of requests it is confident about in milliseconds, and an expensive NLI
-cross-encoder is consulted only for the uncertain middle ~25%.
+You give a language model a document and ask a question. It answers fluently. But fluent is not
+the same as correct — it may invent a date, a number, a name, or an entire fact that the document
+never says. That is a **hallucination**.
+
+Here is a concrete case:
+
+> **Context:** The Eiffel Tower is located in Paris, France. It was completed in 1889.
+>
+> **Question:** Where is the Eiffel Tower and when was it built?
+>
+> **Answer:** The Eiffel Tower is in Rome and was completed in 1950.
+
+Every word is confident. Two facts are wrong. A human reader catches it; a downstream system
+does not.
+
+This project scores that answer **before it reaches the user**. It answers one question:
+
+> *Is this response consistent with the context it was given?*
+
+Note what it is **not**: it is not a fact-checker against the real world. If the source document
+itself is wrong, a faithful answer is still "correct" by this definition. The task is measuring
+**groundedness**, not truth. That distinction is deliberate and worth stating up front.
+
+The output is a **risk score** between 0 and 1, plus a verdict and the name of the path that
+produced it.
 
 ---
 
-## Repo contents
+## How it works
 
-| Path | What it is |
+The system runs in four steps.
+
+### 1. Read the data
+
+HaluEval ships four subsets. Three of them contain *paired* examples: the same context with one
+correct answer and one hallucinated answer. The loader emits both as separate rows, which is why
+10,000 raw examples become 20,000 training rows and why the label balance is naturally close to
+50/50.
+
+| Subset | Raw examples | Rows after pairing |
+|---|---|---|
+| Dialogue | 10,000 | 20,000 |
+| Question answering | 10,000 | 20,000 |
+| Summarisation | 10,000 | 20,000 |
+| General | 4,507 | 4,507 |
+| **Total** | | **64,507** |
+
+Each row is reduced to a common schema: `context`, `prompt`, `response`, `is_hallucination`,
+`task_type`, `group_id`.
+
+### 2. Turn each example into 8 numbers
+
+Models cannot read text, so every example becomes a small vector of interpretable features.
+
+| Feature | What it measures | Intuition |
+|---|---|---|
+| `cosine_similarity` | semantic distance between context and response | do they talk about the same thing? |
+| `prompt_response_cosine` | semantic distance between question and response | does the answer actually address the question? |
+| `reference_length` | size of the source text | how much material there was to be faithful to |
+| `response_length` | size of the answer | longer answers have more room to drift |
+| `length_ratio` | response ÷ reference | is this a summary or a rant? |
+| `lexical_overlap` | Jaccard overlap of word sets | are the same words reused? |
+| `unsupported_number_ratio` | share of numbers in the response absent from the source | invented figures are a strong signal |
+| `context_missing` | 1 if no context was supplied | the "general" subset runs in a different mode |
+
+Semantic features come from `all-MiniLM-L6-v2`, a 384-dimension sentence embedding model. Only the
+*similarity* is kept, not the raw vectors — cheaper, interpretable, and impossible to overfit 384
+dimensions on 8-feature tabular models.
+
+### 3. Train a fast model to handle the easy cases
+
+Five different classifiers look at those 8 numbers and vote:
+
+| Model | Why it is in the ensemble |
 |---|---|
-| `Copy_of_PredictiveProject.ipynb` | Main notebook — data → features → training → cascade → evaluation → UI |
-| `ProjectFinalDeepseek.ipynb` | Earlier working notebook, kept for provenance |
-| `Predictive_Analysis_LLM_Hallucination_Guardrail_Report.docx` | Written report |
-| `guardrail_deployment_package.zip` | Trained artifacts + standalone `pipeclass001.py` / `annmpl0001.py` |
-| `docs/architecture.mmd` | Full system diagram (Mermaid) |
-| `docs/cascade-flow.mmd` | Cascade inference diagram (Mermaid) |
+| Logistic Regression | linear baseline, highly interpretable |
+| Random Forest (100 trees) | captures non-linear splits, robust to outliers |
+| Decision Tree | simple, axis-aligned rules |
+| SVM (RBF kernel) | smooth non-linear boundary |
+| **ANN (PyTorch MLP 8 → 128 → 64 → 1)** | learns feature interactions the others cannot express |
+
+Their predicted probabilities are averaged (**soft voting**). The value of an ensemble is not
+that any single member is excellent — it is that the members fail on *different* rows.
+
+The ANN is a standard feed-forward network with LayerNorm, ReLU and Dropout, trained by
+backpropagation with AdamW on a class-weighted binary cross-entropy loss, stopping early on
+validation average precision. It is wrapped to look like a scikit-learn estimator, so it drops
+into the existing ensemble and serialisation code without any changes elsewhere.
+
+That combination produces a **risk score in roughly 35 ms on GPU**.
+
+### 4. Ask a second, slower model only when the fast one is unsure
+
+This is the **cascade**, and it is the core design idea.
+
+If the fast model's score is confidently low or confidently high — outside the band `0.35` to
+`0.65` — the answer is returned immediately. That covers about **75% of traffic**.
+
+If the score lands in that uncertain middle band, a much more expensive model is consulted: an
+NLI cross-encoder (`cross-encoder/nli-deberta-v3-small`) that reads the context and the response
+together and estimates how likely the response is to be *entailed* by the context. Hallucination
+score is `1 − P(entailment)`.
+
+The two scores are then blended:
+
+```
+final = 0.4 × tier1_score + 0.6 × tier2_score
+```
+
+A response is flagged when the final score crosses the cascade threshold.
+
+**Why bother with two tiers?** Because the expensive model is about 20× slower on CPU. Paying that
+cost on every request — including the three-quarters that were never ambiguous — is waste. The
+cascade buys close to the same quality for a fraction of the average latency.
 
 ---
 
-## Results
+## Evaluation
 
-Last complete run, held-out test of 12,902 samples:
+The split is **group-disjoint**: because each context appears twice (once with the correct answer,
+once with the hallucinated twin), the two twins must never end up on opposite sides of the
+train/test boundary. A normal random split leaks information and inflates every metric.
+`StratifiedGroupKFold` grouped on `group_id` prevents that.
+
+Thresholds are tuned on **out-of-fold** predictions only — every training row is scored by a model
+that never saw it — so the operating point is not fitted to data the model has memorised.
+
+### Last complete run
+
+Held-out test set of 12,902 examples:
 
 | Metric | Safe | Hallucination |
 |---|---|---|
@@ -227,40 +147,100 @@ Last complete run, held-out test of 12,902 samples:
 | Recall | 0.609 | **0.834** |
 | F1 | 0.692 | 0.738 |
 
-Average Precision **0.746** · accuracy 0.717 · confusion TN 4,104 / FP 2,635 / FN 1,022 / TP 5,141.
+Average Precision **0.746** · accuracy 0.717 · TN 4,104 · FP 2,635 · FN 1,022 · TP 5,141
 
-The operating point is deliberately recall-leaning: for a guardrail, an unnecessary warning is
-cheaper than a missed hallucination. Tier-1 resolves 74.8% of traffic; 25.2% escalates to Tier-2.
+Tier-1 resolved 74.8% of traffic; 25.2% escalated to Tier-2.
+Latency: **~35 ms** Tier-1, **~53 ms** end-to-end on GPU, ~234 ms on CPU.
 
-> These figures come from the earlier 5-feature, randomly-split pipeline. The current notebook
-> uses 8 features and a group-disjoint `StratifiedGroupKFold` split, so **re-run before quoting
-> any number** — the stricter split will move them.
+**Read the trade-off correctly.** Hallucination recall is 83% while precision is 66% — the system
+accepts a lot of false alarms to avoid missing real ones. For a guardrail that is the right
+operating point: a spurious warning costs a glance, a missed hallucination ships to the user. The
+threshold is a dial, and the PR curve shows every other setting on it.
 
-Latency once warm: ~35 ms Tier-1, ~53 ms end-to-end on GPU; ~234 ms end-to-end on CPU.
-First call pays 3–8 s to load the 568 MB NLI model.
+> These numbers come from an earlier 5-feature, randomly-split version of the pipeline. The
+> current notebook uses 8 features and the stricter group-disjoint split, so they will move.
+> **Re-run the evaluation cell before quoting any figure.**
 
 ---
 
-## Reusing the trained guardrail (no retraining, no dataset)
+## Project structure
 
-Three files are all you need to persist:
+```
+HaluPredict/
+├── Copy_of_PredictiveProject.ipynb            Main notebook — the whole pipeline end to end
+├── ProjectFinalDeepseek.ipynb                 Earlier working version, kept for provenance
+├── Predictive_Analysis_LLM_Hallucination_
+│   Guardrail_Report.docx                      Written report
+├── guardrail_deployment_package.zip           Trained artifacts + standalone Python modules
+├── docs/
+│   ├── architecture.mmd                       System diagram (Mermaid source)
+│   └── cascade-flow.mmd                       Cascade diagram (Mermaid source)
+├── README.md
+└── .gitignore
+```
+
+The `.mmd` files are plain text; paste either into [mermaid.live](https://mermaid.live) to render it.
+
+---
+
+## What is inside the notebook
+
+The notebook is ordered so it can be run top to bottom in Google Colab.
+
+| Stage | What happens |
+|---|---|
+| **Setup** | Install PyTorch and `sentence-transformers`, clone the HaluEval repository, check for a GPU |
+| **Data loading** | Parse the four JSONL subsets with per-line error recovery, expand paired examples, unify the schema into one DataFrame |
+| **Feature engineering** | Normalise text, compute embeddings, build the 8 feature columns |
+| **ANN definition** | The `TorchMLPClassifier` wrapper class |
+| **Splitting** | Group-disjoint 80/20 hold-out via `StratifiedGroupKFold` |
+| **Training** | Fit the scaler, train all five Tier-1 models, generate out-of-fold scores, tune both thresholds, save artifacts |
+| **Diagnostics** | Per-model average precision table and a standalone ANN scorecard |
+| **Pipeline class** | `CascadedGuardrailPipeline` — loads artifacts and runs the two-tier prediction at inference time |
+| **Benchmarking** | Latency measurement with proper GPU synchronisation, P50/P95/P99 |
+| **Evaluation** | Held-out precision, recall, F1, confusion matrix, AP |
+| **Demo** | Single-example checks, sentence-level streaming scan, interactive UI |
+| **Deployment** | Artifact export/import, ask-anything helpers, ipywidgets form, Gradio app |
+
+---
+
+## How to run
+
+### Full retrain (about 30–40 minutes)
+
+1. Open `Copy_of_PredictiveProject.ipynb` in Google Colab.
+2. Set **Runtime → Change runtime type → T4 GPU**.
+3. **Runtime → Run all**.
+4. Artifacts are written to `./guardrail_artifacts`.
+
+In Colab that folder is temporary — it disappears when the runtime disconnects. To keep it, point
+`ARTIFACT_DIR` at Drive before training:
+
+```python
+ARTIFACT_DIR = "/content/drive/MyDrive/guardrail_artifacts"
+```
+
+### Load a trained model instead (no dataset, no retraining)
+
+Only three files are needed:
 
 ```
 guardrail_artifacts/
-  guardrail_metadata.json
-  guardrail_scaler.joblib
-  tier1_voting_ensemble.joblib
+  guardrail_metadata.json          feature order, thresholds, versions
+  guardrail_scaler.joblib          the fitted StandardScaler
+  tier1_voting_ensemble.joblib     the five trained models
 ```
 
-The HuggingFace models (`all-MiniLM-L6-v2`, `nli-deberta-v3-small`) re-download on first use.
+The two HuggingFace models (`all-MiniLM-L6-v2`, `nli-deberta-v3-small`) download automatically on
+first use — they are not in the zip.
 
 Run order in a fresh session:
 
-1. torch setup cell
+1. PyTorch setup cell
 2. `pip install sentence-transformers`
-3. **ANN definition cell** — must run before any `joblib.load`
-4. pipeline class cell
-5. artifacts cell
+3. **ANN definition cell** — this must run before anything loads a `.joblib`
+4. Pipeline class cell
+5. Artifacts cell
 
 ```python
 import_guardrail(archive_path="guardrail_artifacts.zip")
@@ -274,19 +254,56 @@ check_and_report(
 )
 ```
 
-**Gotcha:** the ensemble pickles `TorchMLPClassifier` by reference. Loading it without the ANN
-class defined raises `AttributeError: Can't get attribute 'TorchMLPClassifier'`.
+**The one gotcha:** the ensemble pickle stores `TorchMLPClassifier` *by reference*, not by value.
+Load it without that class defined and you get
+`AttributeError: Can't get attribute 'TorchMLPClassifier'`. Run the ANN cell first and it never
+happens.
+
+### Interactive interfaces
+
+Two are included, both at the end of the notebook:
+
+- **ipywidgets form** — three boxes and a *Check* button, works inside Colab.
+- **Gradio app** — a browser UI with single check, sentence-by-sentence scan, and a simulated
+  live-typing mode that scores the answer word by word as it appears.
 
 ---
 
-## Known limitation
+## Key design decisions
 
-The gate is symmetric in *score*, not in *correctness*. A confidently-wrong Tier-1 prediction
-skips escalation entirely: "JWST launched in 1999 by the Soviet Union" was scored SAFE by the
-fast path in the last run. That is a calibration problem, and calibration is the next step.
+| Decision | Reason |
+|---|---|
+| Average Precision as headline metric | Accuracy hides the precision/recall trade-off and is dominated by the majority class; AP summarises the whole curve |
+| Group-disjoint split | Prevents the correct/hallucinated twins of one example from leaking across train and test |
+| Thresholds tuned on OOF scores | Stops the operating point being fitted to rows the model already memorised |
+| Scaler fitted inside each fold | No preprocessing leakage |
+| ANN wrapped as an sklearn estimator | Fits the existing ensemble, OOF loop and serialisation unchanged — pure addition, no refactor |
+| Metadata file carries the schema version | A stale artifact fails loudly instead of silently mispredicting with the wrong feature order |
+| Cascade instead of a single model | Most traffic is easy; spend the expensive compute only where it changes the answer |
+| `predict_streaming()` | The product need is to flag the *sentence* where a response goes wrong, not the whole paragraph |
 
 ---
 
-## Stack
+## Known limitations
 
-Python · PyTorch · scikit-learn · sentence-transformers · pandas · Gradio · ipywidgets
+**The gate is symmetric in score, not in correctness.** If the fast model is confidently wrong,
+the request never escalates. In the last run, "JWST was launched in 1999 by the Soviet Union" was
+scored safe by the fast path. That is a calibration failure, not a plumbing failure, and
+calibration is the natural next step.
+
+**HaluEval hallucinations are machine-generated.** Perturbed summaries and ChatGPT-written wrong
+answers may be easier to spot than organic human hallucinations, so these numbers likely overstate
+real-world performance.
+
+**The "general" subset has no context at all.** Those 4,507 rows are scored against the prompt
+instead, which is a different task wearing the same label. The dataset is not homogeneous, and the
+per-task breakdown should be read with that in mind.
+
+**English only, response-level only.** Sentence-level hallucination labels exist in the dataset but
+are unused here.
+
+---
+
+## Tech stack
+
+Python · PyTorch · scikit-learn · sentence-transformers · pandas · NumPy · Gradio · ipywidgets
