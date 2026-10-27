@@ -1,0 +1,20 @@
+%% Hallucination Guardrail - cascade inference path only (slide version)
+%% Paste into https://mermaid.live (Mermaid v10+)
+flowchart LR
+    classDef fast fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#052e16
+    classDef slow fill:#fef3c7,stroke:#d97706,stroke-width:1.5px,color:#451a03
+    classDef out  fill:#111827,stroke:#111827,color:#ffffff
+
+    IN["context - prompt - response"] --> FE["8 features<br/>~1 ms"]
+    FE --> T1["Tier-1 ensemble<br/>LR - RF - DT - SVM - ANN<br/>~35 ms"]
+    T1 --> G{"0.35 - 0.65 ?"}
+    G -->|"~75% confident"| F["Tier-1 fast path<br/>flag if score >= t1"]
+    G -->|"~25% uncertain"| T2["Tier-2 NLI<br/>deberta-v3-small<br/>~26 ms GPU / 527 ms CPU"]
+    T2 --> BL["0.4 * t1 + 0.6 * t2"]
+    BL --> S["flag if score >= cascade threshold"]
+    F --> O["verdict + risk + path"]
+    S --> O
+
+    class F fast
+    class T2,BL slow
+    class O out

@@ -1,0 +1,292 @@
+# HaluPredict — LLM Hallucination Guardrail
+
+A real-time groundedness guardrail for LLM output. Given `(context, prompt, response)`, it
+scores whether the response is supported by the supplied context and flags hallucination
+before the user sees it.
+
+Built as a predictive-analytics project on 64,507 labelled examples from
+[HaluEval](https://github.com/RUCAIBox/HaluEval).
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TD
+    classDef data  fill:#eef2ff,stroke:#4f46e5,stroke-width:1.5px,color:#1e1b4b
+    classDef feat  fill:#ecfeff,stroke:#0891b2,stroke-width:1.5px,color:#083344
+    classDef train fill:#f0fdf4,stroke:#16a34a,stroke-width:1.5px,color:#052e16
+    classDef nli   fill:#fef3c7,stroke:#d97706,stroke-width:1.5px,color:#451a03
+    classDef serve fill:#fdf2f8,stroke:#db2777,stroke-width:1.5px,color:#500724
+    classDef store fill:#f8fafc,stroke:#64748b,stroke-width:1.5px,color:#0f172a
+    classDef eval  fill:#f5f3ff,stroke:#7c3aed,stroke-width:1.5px,color:#2e1065
+
+    subgraph DATA["1 - Data layer"]
+        direction TB
+        D1["HaluEval corpus<br/>dialogue 10k - QA 10k - summarization 10k - general 4.5k"]
+        D2["JSONL loader<br/>per-line JSONDecodeError recovery"]
+        D3["Pair expansion<br/>correct response + hallucinated twin"]
+        D4["Unified schema<br/>context - prompt - response<br/>is_hallucination - task_type - group_id"]
+        D5["64,507 labelled rows<br/>approx 52 / 48 class balance"]
+        D1 --> D2
+        D2 --> D3
+        D3 --> D4
+        D4 --> D5
+    end
+
+    subgraph FEAT["2 - Feature engineering - 8 scalars"]
+        direction TB
+        F1["Text normalisation<br/>lowercase - strip punctuation - collapse whitespace"]
+        F2["all-MiniLM-L6-v2<br/>384-d sentence embeddings - GPU"]
+        F3["Semantic<br/>cosine_similarity - prompt_response_cosine"]
+        F4["Structural<br/>reference_length - response_length - length_ratio"]
+        F5["Lexical / numeric<br/>lexical_overlap - unsupported_number_ratio"]
+        F6["Flag<br/>context_missing"]
+        F7["Feature matrix X - N x 8"]
+        F1 --> F2
+        F2 --> F3
+        F3 --> F7
+        F1 --> F4
+        F4 --> F7
+        F1 --> F5
+        F5 --> F7
+        F1 --> F6
+        F6 --> F7
+    end
+
+    subgraph SPLIT["3 - Validation protocol"]
+        direction TB
+        S1["StratifiedGroupKFold<br/>group_id keeps paired twins together"]
+        S2["Group-disjoint 80 / 20 hold-out"]
+        S3["5-fold OOF scores<br/>scaler fitted inside each fold"]
+        S1 --> S2
+        S1 --> S3
+    end
+
+    subgraph TRAIN["4 - Tier-1 - soft-voting ensemble"]
+        direction TB
+        T0["StandardScaler"]
+        T1["Logistic Regression"]
+        T2["Random Forest - 100 trees"]
+        T3["Decision Tree"]
+        T4["SVM - RBF kernel"]
+        T5["ANN - TorchMLPClassifier<br/>8 -> 128 -> 64 -> 1<br/>LayerNorm - ReLU - Dropout 0.2<br/>BCEWithLogits + pos_weight<br/>AdamW - early stop on val AP"]
+        T6["Soft voting<br/>mean of predicted probabilities"]
+        T7["Threshold tuning on OOF only<br/>max recall s.t. precision >= 0.75<br/>gate band 0.35 - 0.65"]
+        T0 --> T1
+        T0 --> T2
+        T0 --> T3
+        T0 --> T4
+        T0 --> T5
+        T1 --> T6
+        T2 --> T6
+        T3 --> T6
+        T4 --> T6
+        T5 --> T6
+        T6 --> T7
+    end
+
+    subgraph SERVE["5 - Cascaded inference"]
+        direction TB
+        I0["Request<br/>context - prompt - response"]
+        I1["normalise -> embed -> build_features<br/>8 scalars -> scaler.transform"]
+        I2["Tier-1 ensemble<br/>risk score - ~35 ms GPU"]
+        I3{"gate_low <= score <= gate_high ?"}
+        I4["Tier-2 NLI cross-encoder<br/>nli-deberta-v3-small - 568 MB<br/>premise = context, hypothesis = response<br/>score = 1 - P(entailment) - ~26 ms GPU"]
+        I5["final = 0.4 * tier1 + 0.6 * tier2"]
+        I6{"final >= cascade threshold ?"}
+        I7{"tier1 >= tier1 threshold ?"}
+        I8["SAFE - grounded"]
+        I9["FLAG - hallucination"]
+        I0 --> I1
+        I1 --> I2
+        I2 --> I3
+        I3 -->|"no - confident"| I7
+        I3 -->|"yes - uncertain"| I4
+        I4 --> I5
+        I5 --> I6
+        I7 -->|"yes"| I9
+        I7 -->|"no"| I8
+        I6 -->|"yes"| I9
+        I6 -->|"no"| I8
+    end
+
+    subgraph STORE["6 - Artifact contract - schema 1.1"]
+        direction TB
+        A1["guardrail_scaler.joblib"]
+        A2["tier1_voting_ensemble.joblib<br/>pickles TorchMLPClassifier by reference"]
+        A3["guardrail_metadata.json<br/>feature order - thresholds - gate bounds<br/>weights - model list - library versions"]
+        A4["load_guardrail()<br/>refuses unknown schema"]
+        A1 --> A4
+        A2 --> A4
+        A3 --> A4
+    end
+
+    subgraph SURF["7 - Serving surfaces"]
+        direction TB
+        P1["CascadedGuardrailPipeline.predict()"]
+        P2["predict_streaming()<br/>sentence-prefix scan"]
+        P3["ipywidgets form"]
+        P4["Gradio app<br/>single check - sentence scan - live typing"]
+        P5["MCP tool - planned<br/>score_grounding - scan_draft"]
+        P1 --> P3
+        P1 --> P4
+        P1 --> P5
+        P2 --> P4
+    end
+
+    subgraph EVAL["8 - Evaluation"]
+        direction TB
+        E1["Held-out test - 12,902 rows"]
+        E2["Average Precision - per-model AP<br/>precision / recall / F1 - confusion"]
+        E3["Latency P50 / P95 / P99<br/>GPU vs CPU - escalation rate"]
+        E1 --> E2
+        E1 --> E3
+    end
+
+    D5 ==> F1
+    F7 ==> S1
+    S2 ==> T0
+    S3 ==> T7
+    T0 ==> A1
+    T6 ==> A2
+    T7 ==> A3
+    A4 ==> P1
+    P2 ==> E1
+    P1 ==> E1
+
+    class D1,D2,D3,D4,D5 data
+    class F1,F2,F3,F4,F5,F6,F7 feat
+    class S1,S2,S3 train
+    class T0,T1,T2,T3,T4,T5,T6,T7 train
+    class I0,I1,I2,I3,I5,I6,I7,I8,I9 serve
+    class I4 nli
+    class A1,A2,A3,A4 store
+    class P1,P2,P3,P4,P5 serve
+    class E1,E2,E3 eval
+```
+
+### Cascade inference path
+
+```mermaid
+flowchart LR
+    classDef fast fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#052e16
+    classDef slow fill:#fef3c7,stroke:#d97706,stroke-width:1.5px,color:#451a03
+    classDef out  fill:#111827,stroke:#111827,color:#ffffff
+
+    IN["context - prompt - response"] --> FE["8 features<br/>~1 ms"]
+    FE --> T1["Tier-1 ensemble<br/>LR - RF - DT - SVM - ANN<br/>~35 ms"]
+    T1 --> G{"0.35 - 0.65 ?"}
+    G -->|"~75% confident"| F["Tier-1 fast path<br/>flag if score >= t1"]
+    G -->|"~25% uncertain"| T2["Tier-2 NLI<br/>deberta-v3-small<br/>~26 ms GPU / 527 ms CPU"]
+    T2 --> BL["0.4 * t1 + 0.6 * t2"]
+    BL --> S["flag if score >= cascade threshold"]
+    F --> O["verdict + risk + path"]
+    S --> O
+
+    class F fast
+    class T2,BL slow
+    class O out
+```
+
+Source files: [`docs/architecture.mmd`](docs/architecture.mmd), [`docs/cascade-flow.mmd`](docs/cascade-flow.mmd).
+
+---
+
+## The idea in one paragraph
+
+LLMs produce fluent text that is sometimes unfaithful to the source it was given. HaluPredict
+scores **groundedness**: is this response consistent with this context? It is deliberately not a
+world-knowledge fact-checker — if the context is wrong, a faithful answer is still "correct" under
+this definition. Detection runs as a **two-tier cascade**: a five-model soft-voting ensemble
+resolves the ~75% of requests it is confident about in milliseconds, and an expensive NLI
+cross-encoder is consulted only for the uncertain middle ~25%.
+
+---
+
+## Repo contents
+
+| Path | What it is |
+|---|---|
+| `Copy_of_PredictiveProject.ipynb` | Main notebook — data → features → training → cascade → evaluation → UI |
+| `ProjectFinalDeepseek.ipynb` | Earlier working notebook, kept for provenance |
+| `Predictive_Analysis_LLM_Hallucination_Guardrail_Report.docx` | Written report |
+| `guardrail_deployment_package.zip` | Trained artifacts + standalone `pipeclass001.py` / `annmpl0001.py` |
+| `docs/architecture.mmd` | Full system diagram (Mermaid) |
+| `docs/cascade-flow.mmd` | Cascade inference diagram (Mermaid) |
+
+---
+
+## Results
+
+Last complete run, held-out test of 12,902 samples:
+
+| Metric | Safe | Hallucination |
+|---|---|---|
+| Precision | 0.801 | 0.661 |
+| Recall | 0.609 | **0.834** |
+| F1 | 0.692 | 0.738 |
+
+Average Precision **0.746** · accuracy 0.717 · confusion TN 4,104 / FP 2,635 / FN 1,022 / TP 5,141.
+
+The operating point is deliberately recall-leaning: for a guardrail, an unnecessary warning is
+cheaper than a missed hallucination. Tier-1 resolves 74.8% of traffic; 25.2% escalates to Tier-2.
+
+> These figures come from the earlier 5-feature, randomly-split pipeline. The current notebook
+> uses 8 features and a group-disjoint `StratifiedGroupKFold` split, so **re-run before quoting
+> any number** — the stricter split will move them.
+
+Latency once warm: ~35 ms Tier-1, ~53 ms end-to-end on GPU; ~234 ms end-to-end on CPU.
+First call pays 3–8 s to load the 568 MB NLI model.
+
+---
+
+## Reusing the trained guardrail (no retraining, no dataset)
+
+Three files are all you need to persist:
+
+```
+guardrail_artifacts/
+  guardrail_metadata.json
+  guardrail_scaler.joblib
+  tier1_voting_ensemble.joblib
+```
+
+The HuggingFace models (`all-MiniLM-L6-v2`, `nli-deberta-v3-small`) re-download on first use.
+
+Run order in a fresh session:
+
+1. torch setup cell
+2. `pip install sentence-transformers`
+3. **ANN definition cell** — must run before any `joblib.load`
+4. pipeline class cell
+5. artifacts cell
+
+```python
+import_guardrail(archive_path="guardrail_artifacts.zip")
+load_guardrail("./guardrail_artifacts")
+smoke_test()
+
+check_and_report(
+    context="The JWST launched on 25 December 2021 from French Guiana.",
+    prompt="When and where did JWST launch?",
+    response="It launched in 1999 from the Soviet Union.",
+)
+```
+
+**Gotcha:** the ensemble pickles `TorchMLPClassifier` by reference. Loading it without the ANN
+class defined raises `AttributeError: Can't get attribute 'TorchMLPClassifier'`.
+
+---
+
+## Known limitation
+
+The gate is symmetric in *score*, not in *correctness*. A confidently-wrong Tier-1 prediction
+skips escalation entirely: "JWST launched in 1999 by the Soviet Union" was scored SAFE by the
+fast path in the last run. That is a calibration problem, and calibration is the next step.
+
+---
+
+## Stack
+
+Python · PyTorch · scikit-learn · sentence-transformers · pandas · Gradio · ipywidgets
