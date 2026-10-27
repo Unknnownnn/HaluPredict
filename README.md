@@ -1,4 +1,4 @@
-# HaluPredict — LLM Hallucination Guardrail
+# HaluPredict
 
 A machine-learning guardrail that checks whether an AI's answer is actually supported by the
 source text it was given, and flags it when it is not.
@@ -8,10 +8,10 @@ predictive-analytics project.
 
 ---
 
-## The problem, in plain terms
+## The problem, in simple terms
 
 You give a language model a document and ask a question. It answers fluently. But fluent is not
-the same as correct — it may invent a date, a number, a name, or an entire fact the document never
+the same as correct, it may invent a date, a number, a name, or an entire fact the document never
 contains. That is a **hallucination**.
 
 A concrete case:
@@ -45,7 +45,7 @@ The system runs in four steps.
 
 HaluEval ships four subsets. Three of them contain *paired* examples: the same context with one
 correct answer and one hallucinated answer. The loader emits both as separate rows, which is why
-10,000 raw examples become 20,000 training rows — and why the label balance lands close to 50/50
+10,000 raw examples become 20,000 training rows and why the label balance lands close to 50/50
 without any resampling.
 
 | Subset | Raw examples | Rows after pairing |
@@ -75,7 +75,7 @@ Models cannot read text, so each example becomes a small vector of interpretable
 | `context_missing` | 1 if no context was supplied | the "general" subset runs in a different mode |
 
 The two semantic features come from `all-MiniLM-L6-v2`, a 384-dimension sentence embedding model.
-Only the *similarity* is kept, not the raw vectors — cheaper, interpretable, and impossible to
+Only the *similarity* is kept, not the raw vectors - cheaper, interpretable, and impossible to
 overfit on a tabular model with 8 inputs.
 
 ### 3. Train a fast model to handle the easy cases
@@ -90,7 +90,7 @@ Five different classifiers look at those 8 numbers and vote:
 | SVM (RBF kernel) | smooth non-linear boundary |
 | **ANN (PyTorch MLP 8 → 128 → 64 → 1)** | learns feature interactions the others cannot express |
 
-Their predicted probabilities are averaged — *soft voting*. The value of an ensemble is not that
+Their predicted probabilities are averaged - *soft voting*. The value of an ensemble is not that
 any single member is excellent; it is that the members fail on *different* rows.
 
 The ANN is a standard feed-forward network with LayerNorm, ReLU and Dropout between the hidden
@@ -105,8 +105,8 @@ That stage produces a **risk score in about 37 ms on GPU**.
 
 This is the **cascade**, and it is the core design idea.
 
-If the fast model's score is confidently low or confidently high — outside the band **0.35 to
-0.65** — the answer is returned immediately. That covers about **75% of traffic**.
+If the fast model's score is confidently low or confidently high - outside the band **0.35 to
+0.65** - the answer is returned immediately. That covers about **75% of traffic**.
 
 If the score lands in that uncertain middle band, a much more expensive model is consulted: an
 NLI cross-encoder (`cross-encoder/nli-deberta-v3-small`) that reads the context and the response
@@ -122,22 +122,22 @@ final = 0.4 × tier1_score + 0.6 × tier2_score
 A response is flagged when the final score crosses the cascade threshold.
 
 **Why bother with two tiers?** Because the expensive model is far slower. Paying that cost on every
-request — including the three-quarters that were never ambiguous — is waste. The cascade gets
+request - including the three-quarters that were never ambiguous - is waste. The cascade gets
 close to the same quality for a fraction of the average latency.
 
 ---
 
 ## Evaluation
 
-The split is **group-disjoint**. Because each context appears twice — once with the correct answer,
-once with the hallucinated twin — the two twins must never end up on opposite sides of the
+The split is **group-disjoint**. Because each context appears twice - once with the correct answer,
+once with the hallucinated twin - the two twins must never end up on opposite sides of the
 train/test boundary. A normal random split leaks information and quietly inflates every metric.
 `StratifiedGroupKFold` grouped on `group_id` prevents that.
 
 Thresholds are tuned on **out-of-fold** predictions only, so the operating point is never fitted to
 rows the model has already memorised.
 
-### Held-out test set — 12,901 examples
+### Held-out test set - 12,901 examples
 
 | Metric | Safe | Hallucination |
 |---|---|---|
@@ -181,7 +181,7 @@ choice depends on whether a failed check or a false alarm costs more in your app
 Worth reading honestly: on these 8 features the **ANN is the strongest single model**, and the
 ensemble sits slightly *below* it. With only 8 inputs the members are highly correlated, so voting
 averages away some of the ANN's edge rather than building on it. The ensemble is kept because it
-is more stable across subgroups and less sensitive to any one model's failure mode — but if the
+is more stable across subgroups and less sensitive to any one model's failure mode - but if the
 goal were purely to maximise this one number, shipping the ANN alone would be the better call.
 On a richer input representation (the full embedding pair rather than one cosine scalar) the
 ensemble's advantage would likely return.
@@ -194,37 +194,8 @@ ensemble's advantage would likely return.
 | Tier-2 (when triggered) | 27.5 ms | 46.3 ms | 644 ms |
 | **End to end** | **59.9 ms** | **100.7 ms** | **347 ms** |
 
-First inference is slower — about 85 ms on GPU — because the models must be loaded into memory.
+First inference is slower - about 85 ms on GPU - because the models must be loaded into memory.
 After that, a full check takes roughly a fifteenth of a second.
-
----
-
-## Project structure
-
-```
-HaluPredict/
-├── HaluPredict.ipynb                 The whole pipeline, end to end
-├── guardrail_deployment_package.zip  Trained artifacts + standalone Python modules
-├── docs/
-│   ├── architecture.mmd              System diagram (Mermaid source)
-│   └── cascade-flow.mmd              Cascade diagram (Mermaid source)
-├── README.md
-└── .gitignore
-```
-
-The two `.mmd` files are plain text. Paste either into [mermaid.live](https://mermaid.live) to
-render it.
-
-The zip unpacks to:
-
-```
-guardrail.py                 Standalone copy of the pipeline class
-annmpl0001.py                Standalone copy of the ANN class
-pipeclass001.py              Standalone copy of the feature/pipeline logic
-guardrail_metadata.json      Feature order, thresholds, versions
-guardrail_scaler.joblib      The fitted StandardScaler
-tier1_voting_ensemble.joblib  The five trained models
-```
 
 ---
 
@@ -241,7 +212,7 @@ The notebook is ordered so it can be run top to bottom in Google Colab.
 | **Splitting** | Group-disjoint 80/20 hold-out via `StratifiedGroupKFold` |
 | **Training** | Fit the scaler, train all five Tier-1 models, generate out-of-fold scores, tune both thresholds, save artifacts |
 | **Diagnostics** | Per-model average precision table and a standalone ANN scorecard |
-| **Pipeline class** | `CascadedGuardrailPipeline` — loads artifacts and runs the two-tier prediction |
+| **Pipeline class** | `CascadedGuardrailPipeline` - loads artifacts and runs the two-tier prediction |
 | **Benchmarking** | Latency measurement with GPU synchronisation, P50 / P95 / P99 |
 | **Evaluation** | Held-out precision, recall, F1, confusion matrix, average precision |
 | **Visualisations** | Confusion matrix, ROC curve and precision-recall curve |
@@ -260,7 +231,7 @@ The notebook is ordered so it can be run top to bottom in Google Colab.
 3. **Runtime → Run all**.
 4. Artifacts are written to `./guardrail_artifacts`.
 
-In Colab that folder is temporary — it disappears when the runtime disconnects. To keep it, point
+In Colab that folder is temporary - it disappears when the runtime disconnects. To keep it, point
 `ARTIFACT_DIR` at Drive before training:
 
 ```python
@@ -279,13 +250,13 @@ guardrail_artifacts/
 ```
 
 The two HuggingFace models (`all-MiniLM-L6-v2`, `nli-deberta-v3-small`) download automatically on
-first use — they are not in the zip.
+first use - they are not in the zip.
 
 Run order in a fresh session:
 
 1. PyTorch setup cell
 2. `pip install sentence-transformers`
-3. **ANN definition cell** — this must run before anything loads a `.joblib`
+3. **ANN definition cell** - this must run before anything loads a `.joblib`
 4. Pipeline class cell
 5. Deployment cell
 
@@ -309,8 +280,8 @@ Load it without that class defined and you get `AttributeError: Can't get attrib
 
 Two are included, both at the end of the notebook:
 
-- **ipywidgets form** — three boxes and a *Check* button, works inside Colab.
-- **Gradio app** — a browser UI with a single check, a sentence-by-sentence scan, and a simulated
+- **ipywidgets form** - three boxes and a *Check* button, works inside Colab.
+- **Gradio app** - a browser UI with a single check, a sentence-by-sentence scan, and a simulated
   live-typing mode that rescores the answer word by word as it appears.
 
 ---
@@ -323,36 +294,11 @@ Two are included, both at the end of the notebook:
 | Group-disjoint split | Stops the correct/hallucinated twins of one example leaking across train and test |
 | Thresholds tuned on out-of-fold scores | Keeps the operating point away from rows the model already memorised |
 | Scaler fitted inside each fold | No preprocessing leakage |
-| ANN wrapped as an sklearn estimator | Fits the existing ensemble, CV loop and serialisation unchanged — an addition, not a refactor |
+| ANN wrapped as an sklearn estimator | Fits the existing ensemble, CV loop and serialisation unchanged - an addition, not a refactor |
 | Metadata file carries a schema version | A stale artifact fails loudly instead of silently mispredicting with the wrong feature order |
 | Cascade instead of one model | Most traffic is easy; spend the expensive compute only where it changes the answer |
 | `predict_streaming()` | The real product need is to flag the *sentence* where a response goes wrong, not the whole paragraph |
 
 ---
-
-## Known limitations
-
-**The gate is symmetric in score, not in correctness.** If the fast model is confidently wrong, the
-request never escalates. In an earlier run, "JWST was launched in 1999 by the Soviet Union" was
-scored safe by the fast path. That is a calibration failure, not a plumbing failure, and
-calibration is the natural next step.
-
-**HaluEval hallucinations are machine-generated.** Perturbed summaries and ChatGPT-written wrong
-answers may be easier to spot than organic human hallucinations, so these numbers likely overstate
-real-world performance.
-
-**The "general" subset has no context at all.** Those 4,507 rows are scored against the prompt
-instead, which is a different task wearing the same label. The dataset is not homogeneous, and the
-per-task breakdown should be read with that in mind.
-
-**English only, response-level only.** Sentence-level hallucination labels exist in the dataset but
-are unused here.
-
-**No variance estimate.** Every number above comes from a single seed and a single split.
-
----
-
-## Tech stack
-
-Python · PyTorch · scikit-learn · sentence-transformers · pandas · NumPy · Matplotlib · Gradio ·
+rmers · pandas · NumPy · Matplotlib · Gradio ·
 ipywidgets
